@@ -25,6 +25,22 @@ ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
 info()    { printf '\033[36m·\033[0m %s\n' "$*"; }
 need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
 
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
+        || die "无效端口: $port（有效范围 1-65535）"
+}
+
+write_file_atomic() {
+    local target="$1" mode="$2" content="$3" dir tmp
+    dir=$(dirname "$target")
+    mkdir -p "$dir"
+    tmp=$(mktemp "${dir}/.$(basename "$target").XXXXXX") || die "无法创建临时文件: $dir"
+    printf '%s\n' "$content" > "$tmp"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$target"
+}
+
 urlencode() {
     local s="$1" c
     local -i i
@@ -159,14 +175,14 @@ rand_port() {
 # ── CF API ────────────────────────────────────────────
 cf_call() {
     local method="$1" endpoint="$2" data="${3:-}"
-    local args=(-s -f -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+    local args=(-sS -f --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
     [[ -n "$data" ]] && args+=(-d "$data")
     curl "${args[@]}" "${CF_API}${endpoint}"
 }
 
 cf_call_raw() {
     local method="$1" endpoint="$2" data="${3:-}"
-    local args=(-s -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+    local args=(-sS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
     [[ -n "$data" ]] && args+=(-d "$data")
     curl "${args[@]}" "${CF_API}${endpoint}"
 }
@@ -183,8 +199,8 @@ load_cf_account() {
 
 save_cf_account() {
     mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
-    jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" '{email:$e,api_key:$k}' > "$CF_ACCOUNT_PATH"
-    chmod 600 "$CF_ACCOUNT_PATH"
+    write_file_atomic "$CF_ACCOUNT_PATH" 600 \
+        "$(jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" '{email:$e,api_key:$k}')"
 }
 
 # 验证 CF 凭据是否有效（用 verify 接口，避免拿到无效 key 继续跑）
@@ -464,9 +480,7 @@ gen_xray_config() {
 }
 
 write_xray_config() {
-    mkdir -p "$XRAY_CONFIG_DIR"
-    echo "$1" > "$XRAY_CONFIG_PATH"
-    chmod 644 "$XRAY_CONFIG_PATH"
+    write_file_atomic "$XRAY_CONFIG_PATH" 644 "$1"
     ok "xray 配置已写入 $XRAY_CONFIG_PATH"
 }
 
@@ -490,16 +504,16 @@ gen_all_links() {
 }
 
 # ── 状态 ──────────────────────────────────────────────
-load_state() { [[ -f "$STATE_PATH" ]] && cat "$STATE_PATH"; }
-save_state() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; echo "$1" > "$STATE_PATH"; chmod 600 "$STATE_PATH"; }
+load_state() { [[ -f "$STATE_PATH" ]] && jq -e '.' "$STATE_PATH"; }
+save_state() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; write_file_atomic "$STATE_PATH" 600 "$1"; }
 remove_state() { rm -f "$STATE_PATH"; }
 
 save_links_snapshot() {
     local domain="$1" uid="$2" links_json="$3"
-    { echo "域名: $domain"; echo "UUID: $uid"; echo
-      echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"'
-    } > "$LAST_LINKS_PATH"
-    chmod 600 "$LAST_LINKS_PATH"
+    local content
+    content=$(printf '域名: %s\nUUID: %s\n\n' "$domain" "$uid"
+        echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"')
+    write_file_atomic "$LAST_LINKS_PATH" 600 "$content"
 }
 
 print_links() {
@@ -566,9 +580,9 @@ build_routes() {
         for proto in "${protocols[@]}"; do
             local int_port ext_port
             read -rp "${proto} 内部监听端口(xray监听): " int_port
-            [[ "$int_port" =~ ^[0-9]+$ ]] || die "无效端口: $int_port"
+            validate_port "$int_port"
             read -rp "${proto} 外部映射端口(对外暴露): " ext_port
-            [[ "$ext_port" =~ ^[0-9]+$ ]] || die "无效端口: $ext_port"
+            validate_port "$ext_port"
             local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
             routes_json=$(echo "$routes_json" | jq \
                 --arg p "$proto" --argjson lp "$((int_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
@@ -589,7 +603,7 @@ build_routes() {
             local port
             if [[ ${#custom_ports[@]} -gt 0 ]]; then
                 port="${custom_ports[$pi]// /}"
-                [[ "$port" =~ ^[0-9]+$ ]] || die "无效端口: $port"
+                validate_port "$port"
             else
                 port=$(rand_port "$existing_ports")
             fi
@@ -816,7 +830,8 @@ do_modify() {
                 local idx=0
                 for m in "${maps[@]}"; do
                     m="${m// /}"; local lp="${m%%:*}" cp="${m##*:}"
-                    [[ "$lp" =~ ^[0-9]+$ && "$cp" =~ ^[0-9]+$ ]] || die "无效: $m"
+                    [[ "$m" == *:* ]] || die "无效端口映射: $m"
+                    validate_port "$lp"; validate_port "$cp"
                     new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson l "$((lp))" --argjson c "$((cp))" '.[$i].listen_port=$l|.[$i].cf_port=$c')
                     idx=$((idx+1))
                 done
@@ -830,7 +845,7 @@ do_modify() {
                 [[ ${#nps[@]} -eq $pc ]] || die "数量不匹配"
                 local idx=0
                 for np in "${nps[@]}"; do
-                    np="${np// /}"; [[ "$np" =~ ^[0-9]+$ ]] || die "无效: $np"
+                    np="${np// /}"; validate_port "$np"
                     new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((np))" '.[$i].listen_port=$p|.[$i].cf_port=$p')
                     idx=$((idx+1))
                 done
@@ -912,7 +927,7 @@ do_update_ports() {
         while IFS=$'\t' read -r proto old_cp; do
             read -rp "${proto} 新外部端口(当前=${old_cp}): " ne
             [[ -n "$ne" ]] || die "不能为空"
-            [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
+            validate_port "$ne"
             new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
             idx=$((idx+1))
         done < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
