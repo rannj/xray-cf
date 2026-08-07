@@ -13,12 +13,6 @@ LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="xray-cf-lite "
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-SUB_BASE="https://yx-auto.pages.dev"
-
-declare -A PROTO_SUFFIX=([vless]="vl" [trojan]="tr" [vmess]="vm")
-declare -A PROTO_LABEL=([vless]="VLESS" [trojan]="TROJAN" [vmess]="VMESS")
-declare -A PROTO_FLAG=([vless]="ev" [trojan]="et" [vmess]="mess")
-
 # ── 工具 ──────────────────────────────────────────────
 die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -380,7 +374,7 @@ build_new_origin_rules() {
         .[] | {
             description: ($pfx + .protocol + " " + .path),
             enabled: true,
-            expression: ("(http.host eq \"" + $d + "\" and http.request.uri.path eq \"" + .path + "\")"),
+            expression: ("(http.host eq \"" + $d + "\" and (http.request.uri.path eq \"" + .path + "\" or starts_with(http.request.uri.path, \"" + .path + "/\")))"),
             action: "route",
             action_parameters: { origin: { port: .cf_port } }
         }
@@ -457,18 +451,13 @@ gen_xray_config() {
     local inbounds
     inbounds=$(echo "$routes_json" | jq --arg uid "$uid" '[
         .[] | {
-            tag: ("in-" + .protocol + "-" + (.listen_port|tostring)),
+            tag: ("in-vless-xhttp-" + (.listen_port|tostring)),
             listen: "0.0.0.0",
             port: .listen_port,
-            protocol: .protocol,
-            settings: (
-                if .protocol == "vless" then {clients:[{id:$uid,flow:""}],decryption:"none"}
-                elif .protocol == "trojan" then {clients:[{password:$uid}]}
-                else {clients:[{id:$uid,alterId:0}]}
-                end
-            ),
-            streamSettings: { network:"ws", security:"none", wsSettings:{path:.path} },
-            sniffing: { enabled:true, destOverride:["http","tls"] }
+            protocol: "vless",
+            settings: {clients:[{id:$uid}],decryption:"none"},
+            streamSettings: {network:"xhttp",security:"none",xhttpSettings:{path:.path}},
+            sniffing: {enabled:true,destOverride:["http","tls","quic"]}
         }
     ]')
     jq -n --argjson inb "$inbounds" '{
@@ -486,21 +475,19 @@ write_xray_config() {
 
 # ── 订阅链接 ─────────────────────────────────────────
 build_link() {
-    local uid="$1" domain="$2" proto="$3" path="$4"
-    local ev="no" et="no" evm="no"
-    case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    local uid="$1" domain="$2" path="$3"
+    local query name
+    query="encryption=none&security=tls&sni=$(urlencode "$domain")&fp=chrome&type=xhttp&path=$(urlencode "$path")&mode=stream-up"
+    name=$(urlencode "VLESS XHTTP ${domain}")
+    echo "vless://${uid}@${domain}:443?${query}#${name}"
 }
 
 gen_all_links() {
     local uid="$1" domain="$2" routes_json="$3"
-    local links_json='{}'
-    local proto path link
-    while IFS=$'\t' read -r proto path; do
-        link=$(build_link "$uid" "$domain" "$proto" "$path")
-        links_json=$(echo "$links_json" | jq --arg p "$proto" --arg l "$link" '. + {($p):$l}')
-    done < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv')
-    echo "$links_json"
+    local path link
+    path=$(echo "$routes_json" | jq -r '.[0].path')
+    link=$(build_link "$uid" "$domain" "$path")
+    jq -n --arg link "$link" '{vless_xhttp:$link}'
 }
 
 # ── 状态 ──────────────────────────────────────────────
@@ -520,28 +507,11 @@ print_links() {
     local links_json="$1"
     local proto link
     while IFS=$'\t' read -r proto link; do
-        echo "  ${PROTO_LABEL[$proto]:-$proto}订阅 $link"
+        echo "  VLESS XHTTP 节点 $link"
     done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
 }
 
 # ── 交互辅助 ─────────────────────────────────────────
-prompt_protocols() {
-    read -rp "创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): " proto_raw
-    local protocols=()
-    if [[ -z "$proto_raw" ]]; then
-        protocols=(vless trojan vmess)
-    else
-        local -A pmap=([1]=vless [2]=trojan [3]=vmess [vless]=vless [trojan]=trojan [vmess]=vmess)
-        IFS=',' read -ra tokens <<< "$proto_raw"
-        for t in "${tokens[@]}"; do
-            t="${t,,}"; t="${t// /}"
-            [[ -n "${pmap[$t]:-}" ]] || die "未知协议: $t"
-            protocols+=("${pmap[$t]}")
-        done
-    fi
-    echo "${protocols[@]}"
-}
-
 prompt_uuid() {
     local uid
     read -rp "UUID(留空=自动生成): " custom_uuid
@@ -556,7 +526,7 @@ prompt_uuid() {
 
 prompt_path_prefix() {
     local default="$1"
-    read -rp "WS 路径前缀(留空=/${default}): " pfx
+    read -rp "XHTTP 路径(留空=/${default}): " pfx
     [[ -z "$pfx" ]] && pfx="/${default}"
     [[ "$pfx" == /* ]] || pfx="/${pfx}"
     echo "$pfx"
@@ -566,57 +536,29 @@ prompt_path_prefix() {
 # NAT 时 xray 监听 listen_port(内部)，CF 转发到 cf_port(外部)
 # 直连时 listen_port == cf_port
 build_routes() {
-    local net_mode="$1" path_prefix="$2" proto_count="$3"
-    shift 3
-    local protocols=("$@")
-
-    local routes_json='[]'
+    local net_mode="$1" path="$2" listen_port cf_port
 
     if [[ "$net_mode" == "nat" ]]; then
         echo >&2
-        info "NAT 模式: 逐个配置每个协议的端口映射" >&2
+        info "NAT 模式: 配置 VLESS XHTTP 端口映射" >&2
         echo >&2
-
-        for proto in "${protocols[@]}"; do
-            local int_port ext_port
-            read -rp "${proto} 内部监听端口(xray监听): " int_port
-            validate_port "$int_port"
-            read -rp "${proto} 外部映射端口(对外暴露): " ext_port
-            validate_port "$ext_port"
-            local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-            routes_json=$(echo "$routes_json" | jq \
-                --arg p "$proto" --argjson lp "$((int_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
-                '. + [{protocol:$p, listen_port:$lp, cf_port:$cp, path:$pa}]')
-        done
+        read -rp "内部监听端口(xray监听): " listen_port
+        validate_port "$listen_port"
+        read -rp "外部映射端口(对外暴露): " cf_port
+        validate_port "$cf_port"
     else
-        read -rp "自定义端口?(逗号分隔，留空=随机): " custom_ports_raw
-        local existing_ports
-        existing_ports=$(get_listening_ports)
-        local custom_ports=()
-        if [[ -n "$custom_ports_raw" ]]; then
-            IFS=',' read -ra custom_ports <<< "$custom_ports_raw"
-            [[ ${#custom_ports[@]} -eq $proto_count ]] || die "端口数量与协议数不一致"
+        read -rp "自定义端口?(留空=随机): " listen_port
+        if [[ -n "$listen_port" ]]; then
+            listen_port="${listen_port// /}"
+            validate_port "$listen_port"
+        else
+            listen_port=$(rand_port "$(get_listening_ports)")
         fi
-
-        local pi=0
-        for proto in "${protocols[@]}"; do
-            local port
-            if [[ ${#custom_ports[@]} -gt 0 ]]; then
-                port="${custom_ports[$pi]// /}"
-                validate_port "$port"
-            else
-                port=$(rand_port "$existing_ports")
-            fi
-            existing_ports="$existing_ports $port"
-            local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-            routes_json=$(echo "$routes_json" | jq \
-                --arg p "$proto" --argjson lp "$((port))" --arg pa "$path" \
-                '. + [{protocol:$p, listen_port:$lp, cf_port:$lp, path:$pa}]')
-            pi=$((pi + 1))
-        done
+        cf_port="$listen_port"
     fi
 
-    echo "$routes_json"
+    jq -n --argjson lp "$((listen_port))" --argjson cp "$((cf_port))" --arg path "$path" \
+        '[{protocol:"vless",transport:"xhttp",listen_port:$lp,cf_port:$cp,path:$path}]'
 }
 
 # ── 1. 安装 ──────────────────────────────────────────
@@ -648,10 +590,6 @@ do_install() {
         echo "无法在该 CF 账号下匹配 Zone: $domain，请确认域名已托管并重输（Ctrl+C 退出）"
     done
 
-    local protocols_str
-    protocols_str=$(prompt_protocols)
-    read -ra protocols <<< "$protocols_str"
-
     local uid
     uid=$(prompt_uuid)
     local short_id="${uid:0:8}"
@@ -659,7 +597,7 @@ do_install() {
     path_prefix=$(prompt_path_prefix "$short_id")
 
     local routes_json
-    routes_json=$(build_routes "$net_mode" "$path_prefix" "${#protocols[@]}" "${protocols[@]}")
+    routes_json=$(build_routes "$net_mode" "$path_prefix")
 
     # 预览
     echo
@@ -692,9 +630,9 @@ do_install() {
     cf_set_ssl "$zone_id" "flexible"
     ok "SSL 模式: flexible"
     apply_origin_rules "$zone_id" "$domain" "$routes_json"
-    ok "Origin Rules: ${#protocols[@]} 条"
+    ok "Origin Rules: 1 条"
 
-    # 安全规则：关闭可能拦截 WS 的设置
+    # 安全规则：关闭可能拦截 XHTTP 请求的设置
     local security_backup
     security_backup=$(cf_relax_security "$zone_id")
 
@@ -712,7 +650,7 @@ do_install() {
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
         --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
-        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,routes:$routes,
+        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,transport:"xhttp",routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
           ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
 
@@ -783,6 +721,8 @@ do_show() {
 do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
+    [[ "$(echo "$state" | jq -r '.transport // ""')" == "xhttp" ]] \
+        || die "检测到旧版非 XHTTP 部署，请先卸载后重新安装"
 
     local domain uid routes_json net_mode
     domain=$(echo "$state" | jq -r '.domain')
@@ -797,7 +737,7 @@ do_modify() {
     echo
     echo "  1. 修改 UUID"
     echo "  2. 修改端口"
-    echo "  3. 修改 WS 路径"
+    echo "  3. 修改 XHTTP 路径"
     echo "  4. 全部修改"
     echo "  0. 返回"
     echo
@@ -856,10 +796,10 @@ do_modify() {
 
     if [[ "$mc" == "3" || "$mc" == "4" ]]; then
         echo "当前路径: $(echo "$new_routes" | jq -r '[.[].path] | join(", ")')"
-        read -rp "新 WS 路径前缀(留空=不改): " np
+        read -rp "新 XHTTP 路径(留空=不改): " np
         if [[ -n "$np" ]]; then
             [[ "$np" == /* ]] || np="/${np}"
-            new_routes=$(echo "$new_routes" | jq --arg pfx "$np" '[.[]|.path=($pfx+"-"+(if .protocol=="vless" then "vl" elif .protocol=="trojan" then "tr" else "vm" end))]')
+            new_routes=$(echo "$new_routes" | jq --arg path "$np" '[.[]|.path=$path]')
             changed=true; ok "路径已更新"
         fi
     fi
@@ -1005,7 +945,7 @@ main() {
     echo "  1. 安装节点"
     echo "  2. 卸载"
     echo "  3. 查看订阅"
-    echo "  4. 修改配置(UUID/端口/路径)"
+    echo "  4. 修改配置(UUID/端口/XHTTP路径)"
     echo "  5. 查看当前配置"
     echo "  6. 更新外部端口(NAT换端口)"
     echo "  7. 重启 xray"

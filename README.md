@@ -1,6 +1,6 @@
 # xray-cf-lite
 
-最小化 xray + Cloudflare 节点部署脚本。不需要面板，一个 Bash 脚本搞定。
+最小化 VLESS + XHTTP + Cloudflare 节点部署脚本。不需要面板，一个 Bash 脚本搞定。
 
 ## 适用场景
 
@@ -38,8 +38,8 @@
 如果服务器是 NAT（内网 IP，通过端口映射暴露服务），需要提前知道：
 
 - SSH 端口映射（用于登录）
-- 可用的端口映射（用于节点，至少 1 组，每个协议需要 1 组）
-- 安装时按提示逐个输入每个协议的内部端口和外部端口
+- 一组可用的端口映射（用于 VLESS XHTTP 节点）
+- 安装时按提示输入内部端口和外部端口
 
 ## 安装
 
@@ -63,7 +63,7 @@ x
 1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成订阅链接
 2. 卸载            停止 xray + 回滚 CF 配置(DNS/SSL/Origin Rules) + 清理本地状态/凭据/订阅快照
 3. 查看订阅        显示上次生成的订阅链接
-4. 修改配置        修改 UUID / 端口 / WS 路径（可单改或全改）
+4. 修改配置        修改 UUID / 端口 / XHTTP 路径（可单改或全改）
 5. 查看当前配置    显示域名、UUID、端口映射、xray 服务状态、订阅链接
 6. 更新外部端口    NAT 换端口专用：只更新 CF Origin Rules，不重启 xray
 ```
@@ -74,22 +74,18 @@ x
 |------|------|--------|
 | 域名 | 绑定到 CF 的子域名 | 必填 |
 | CF 凭据 | 邮箱 + Global API Key | 首次必填，之后自动复用 |
-| 协议 | vless / trojan / vmess | 全部 |
+| 协议与传输 | VLESS + XHTTP | 固定 |
 | UUID | 节点身份标识 | 自动生成 |
 | 端口 | xray 监听端口 | 随机（直连）/ 手动输入映射（NAT） |
-| WS 路径前缀 | WebSocket 路径 | `/{UUID前8位}` |
+| XHTTP 路径 | XHTTP 请求路径 | `/{UUID前8位}` |
 
 ## NAT 端口映射
 
 脚本自动检测 NAT 环境。安装时按提示输入端口映射：
 
 ```
-vless 内部监听端口(xray监听): 80
-vless 外部映射端口(对外暴露): 15331
-trojan 内部监听端口(xray监听): 8080
-trojan 外部映射端口(对外暴露): 15333
-vmess 内部监听端口(xray监听): 8443
-vmess 外部映射端口(对外暴露): 15334
+内部监听端口(xray监听): 80
+外部映射端口(对外暴露): 15331
 ```
 
 - 内部端口 = xray 在容器内监听的端口
@@ -124,10 +120,11 @@ xray 进程崩溃后 1 秒自动拉起，无限重启：
 ```
 
 - Cloudflare 代理域名，客户端通过 CDN 连接
-- Origin Rules 将不同路径的请求转发到不同端口
+- Origin Rules 将 XHTTP 路径及其动态子路径转发到节点端口
 - SSL 模式设为 `flexible`（CF 到源站用 HTTP）
-- xray 使用 WebSocket 传输，每个协议监听独立端口
-- 订阅链接通过 `yx-auto.pages.dev` 生成，包含多个 CF 优选 IP
+- xray 使用 VLESS + XHTTP，服务端采用 XHTTP 默认模式
+- 生成的客户端节点使用 `stream-up`，利用 Cloudflare 已开启的 gRPC 支持实现流式上行
+- 客户端通过 Cloudflare 443/TLS 连接，Cloudflare 到源站由 Origin Rules 回源
 
 ## 注意事项
 
@@ -136,6 +133,11 @@ xray 进程崩溃后 1 秒自动拉起，无限重启：
 - CF 凭据保存在服务器本地，不会上传到任何地方；输入时会实时校验，错误可当场重输（不会直接退出）
 - 一台服务器同时只支持一组部署（再次安装需先卸载）
 
-## 致谢
+## XHTTP 说明
 
-订阅服务基于 [xui-cf-deployer](https://github.com/byJoey/xui-cf-deployer) 项目的 `yx-auto.pages.dev`。
+- 服务端仅设置随机路径，其余 XHTTP 参数采用 Xray Core 默认值。
+- Cloudflare 需要预先开启 gRPC；脚本生成的客户端节点固定使用 `stream-up`。
+- XHTTP 会在基础路径后追加会话标识，因此 Origin Rule 使用路径前缀匹配。
+- 节点链接要求客户端支持 XHTTP；旧版仅支持 WebSocket 的客户端无法使用。
+- 已通过旧版脚本部署的 WS 节点需要先卸载，再使用新版脚本重新安装。
+- 设计与参数说明参见 [Xray Core XHTTP 官方文档](https://xtls.github.io/config/transports/xhttp.html)。
