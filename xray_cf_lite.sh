@@ -470,22 +470,11 @@ do_restart() {
     cloudflared_start
 }
 
-ensure_shortcut() {
-    local target="/usr/local/bin/x"
-    [[ -f "$target" ]] && return
-    cat > "$target" <<'EOF'
-#!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh) "$@"
-EOF
-    chmod +x "$target"
-}
-
 main() {
     [[ "$(id -u)" == 0 ]] || die "请使用 root 运行此脚本"
     detect_init
     install_deps
     need_cmd curl; need_cmd jq
-    ensure_shortcut
 
     local current=""
     if [[ -f "$STATE_PATH" ]]; then

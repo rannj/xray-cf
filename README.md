@@ -35,18 +35,6 @@
 
 ## 安装
 
-旧版使用公网端口、DNS A 记录和 Origin Rules 的部署不能原地迁移，请先备份节点信息并清理旧部署，再按本页步骤安装 Tunnel 版本。
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh)
-```
-
-首次运行后可使用快捷命令：
-
-```bash
-x
-```
-
 安装时依次输入：
 
 - Tunnel 公开域名
