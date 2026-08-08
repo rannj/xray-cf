@@ -271,7 +271,7 @@ install_xray() {
 gen_xray_config() {
     local port="$1" uid="$2" path="$3"
     jq -n --argjson port "$port" --arg uid "$uid" --arg path "$path" '{
-        log:{loglevel:"warning"},
+        log:{loglevel:"warning",access:"none"},
         inbounds:[{
             tag:"in-vless-xhttp",
             listen:"127.0.0.1",
@@ -279,15 +279,9 @@ gen_xray_config() {
             protocol:"vless",
             settings:{clients:[{id:$uid}],decryption:"none"},
             streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path}},
-            sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+            sniffing:{enabled:false}
         }],
-        outbounds:[
-            {tag:"direct",protocol:"freedom"},
-            {tag:"block",protocol:"blackhole"}
-        ],
-        routing:{domainStrategy:"AsIs",rules:[
-            {type:"field",outboundTag:"block",protocol:["bittorrent"]}
-        ]}
+        outbounds:[{tag:"direct",protocol:"freedom"}]
     }'
 }
 
