@@ -320,13 +320,13 @@ cf_relax_security() {
     # 降低 security level
     if [[ "$sec_level" != "essentially_off" ]]; then
         cf_set_security_level "$zone_id" "essentially_off"
-        ok "Security Level: essentially_off"
+        ok "Security Level: essentially_off" >&2
     fi
 
     # 关闭 Browser Integrity Check
     if [[ "$browser_check" != "off" ]]; then
         cf_set_browser_check "$zone_id" "off"
-        ok "Browser Check: off"
+        ok "Browser Check: off" >&2
     fi
 
     # 关闭 Bot Fight Mode
@@ -334,7 +334,7 @@ cf_relax_security() {
     sbfm_likely=$(echo "$bot_mgmt" | jq -r '.sbfm_likely_automated // ""')
     if [[ "$sbfm_likely" != "allow" ]]; then
         cf_set_bot_fight_off "$zone_id"
-        ok "Bot Fight Mode: 已关闭"
+        ok "Bot Fight Mode: 已关闭" >&2
     fi
 
     # 返回备份 JSON
@@ -492,7 +492,16 @@ gen_all_links() {
 
 # ── 状态 ──────────────────────────────────────────────
 load_state() { [[ -f "$STATE_PATH" ]] && jq -e '.' "$STATE_PATH"; }
-save_state() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; write_file_atomic "$STATE_PATH" 600 "$1"; }
+load_existing_state() {
+    [[ -f "$STATE_PATH" ]] || die "未检测到部署"
+    load_state 2>/dev/null || die "状态文件损坏: $STATE_PATH（请勿重新安装覆盖现场）"
+}
+save_state() {
+    local state_json="$1"
+    echo "$state_json" | jq -e '.' &>/dev/null || die "拒绝写入无效状态 JSON"
+    mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+    write_file_atomic "$STATE_PATH" 600 "$state_json"
+}
 remove_state() { rm -f "$STATE_PATH"; }
 
 save_links_snapshot() {
@@ -564,7 +573,11 @@ build_routes() {
 # ── 1. 安装 ──────────────────────────────────────────
 do_install() {
     local state
-    state=$(load_state 2>/dev/null || true)
+    if [[ -f "$STATE_PATH" ]]; then
+        state=$(load_state 2>/dev/null) || die "状态文件损坏: $STATE_PATH（请先修复或备份现场）"
+    else
+        state=""
+    fi
     [[ -n "$state" ]] && die "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"
 
     [[ -f "$XRAY_BINARY" ]] && ok "xray-core 已安装" || install_xray
@@ -635,6 +648,7 @@ do_install() {
     # 安全规则：关闭可能拦截 XHTTP 请求的设置
     local security_backup
     security_backup=$(cf_relax_security "$zone_id")
+    echo "$security_backup" | jq -e '.' &>/dev/null || die "安全规则备份不是有效 JSON"
 
     # 订阅
     local links_json
@@ -644,7 +658,8 @@ do_install() {
     # 状态
     local dns_existed="false"
     [[ "$dns_before" != "null" ]] && dns_existed="true"
-    save_state "$(jq -n \
+    local state_json
+    state_json=$(jq -n \
         --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
         --argjson routes "$routes_json" \
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
@@ -652,7 +667,9 @@ do_install() {
         --argjson secbk "$security_backup" \
         '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,transport:"xhttp",routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
-          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
+          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}') \
+        || die "生成部署状态失败"
+    save_state "$state_json"
 
     echo
     ok "部署完成"
@@ -664,8 +681,7 @@ do_install() {
 # ── 2. 卸载 ──────────────────────────────────────────
 do_uninstall() {
     local state
-    state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到上次配置"
+    state=$(load_existing_state)
 
     local domain; domain=$(echo "$state" | jq -r '.domain')
     echo "正在卸载: $domain"
@@ -710,8 +726,7 @@ do_uninstall() {
 # ── 3. 查看订阅 ──────────────────────────────────────
 do_show() {
     if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "无历史订阅"
+    local state; state=$(load_existing_state)
     echo "域名: $(echo "$state" | jq -r '.domain')"
     echo "UUID: $(echo "$state" | jq -r '.uuid')"
     echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
@@ -719,8 +734,7 @@ do_show() {
 
 # ── 4. 修改配置 ──────────────────────────────────────
 do_modify() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
+    local state; state=$(load_existing_state)
     [[ "$(echo "$state" | jq -r '.transport // ""')" == "xhttp" ]] \
         || die "检测到旧版非 XHTTP 部署，请先卸载后重新安装"
 
@@ -824,8 +838,7 @@ do_modify() {
 
 # ── 5. 查看当前配置 ──────────────────────────────────
 do_show_config() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
+    local state; state=$(load_existing_state)
 
     echo
     echo "域名:  $(echo "$state" | jq -r '.domain')"
@@ -844,8 +857,7 @@ do_show_config() {
 
 # ── 6. 更新外部端口（NAT 快捷操作）──────────────────
 do_update_ports() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
+    local state; state=$(load_existing_state)
 
     local domain routes_json net_mode
     domain=$(echo "$state" | jq -r '.domain')
@@ -933,7 +945,11 @@ main() {
     ensure_shortcut
 
     local state current_domain="" net_mode=""
-    state=$(load_state 2>/dev/null || true)
+    if [[ -f "$STATE_PATH" ]]; then
+        state=$(load_state 2>/dev/null) || die "状态文件损坏: $STATE_PATH（请先修复或备份现场）"
+    else
+        state=""
+    fi
     if [[ -n "$state" ]]; then
         current_domain=$(echo "$state" | jq -r '.domain // ""')
         net_mode=$(echo "$state" | jq -r '.net_mode // ""')
