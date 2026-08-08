@@ -292,17 +292,20 @@ gen_xray_config() {
 }
 
 write_xray_config() {
-    local content="$1" tmp validation_output
+    local content="$1" tmp_dir tmp validation_output
     mkdir -p "$XRAY_CONFIG_DIR"
-    tmp=$(mktemp "$XRAY_CONFIG_DIR/.config.json.XXXXXX")
+    tmp_dir=$(mktemp -d "$XRAY_CONFIG_DIR/.config.XXXXXX")
+    tmp="$tmp_dir/config.json"
     printf '%s\n' "$content" > "$tmp"
-    if ! validation_output=$("$XRAY_BINARY" run -test -format=json -config "$tmp" 2>&1); then
+    if ! validation_output=$("$XRAY_BINARY" run -test -config "$tmp" 2>&1); then
         printf '%s\n' "$validation_output" >&2
         rm -f "$tmp"
+        rmdir "$tmp_dir"
         die "生成的 Xray 配置未通过校验"
     fi
     chmod 644 "$tmp"
     mv -f "$tmp" "$XRAY_CONFIG_PATH"
+    rmdir "$tmp_dir"
     ok "xray 配置已写入 $XRAY_CONFIG_PATH"
 }
 
