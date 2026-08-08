@@ -174,7 +174,7 @@ Requires=xray.service
 
 [Service]
 Type=simple
-ExecStart=$CLOUDFLARED_BINARY tunnel --no-autoupdate run --token-file $TUNNEL_TOKEN_PATH
+ExecStart=$CLOUDFLARED_BINARY tunnel --protocol http2 --edge-ip-version 4 --no-autoupdate run --token-file $TUNNEL_TOKEN_PATH
 Restart=on-failure
 RestartSec=2
 
@@ -188,7 +188,7 @@ EOF
 name="$CLOUDFLARED_SERVICE"
 description="Cloudflare Tunnel for xray-cf-lite"
 command="$CLOUDFLARED_BINARY"
-command_args="tunnel --no-autoupdate run --token-file $TUNNEL_TOKEN_PATH"
+command_args="tunnel --protocol http2 --edge-ip-version 4 --no-autoupdate run --token-file $TUNNEL_TOKEN_PATH"
 command_background=true
 pidfile="/run/$CLOUDFLARED_SERVICE.pid"
 output_log="/var/log/$CLOUDFLARED_SERVICE.log"

@@ -58,6 +58,8 @@
 
 脚本创建独立的 `cloudflared-xray` 服务，不调用 `cloudflared service install`，也不会覆盖已有的 `cloudflared.service` 或 `/etc/cloudflared/config.yml`。
 
+Tunnel 连接固定使用 HTTP/2 和 IPv4：`--protocol http2 --edge-ip-version 4`。
+
 Tunnel Token 保存在：
 
 ```text
