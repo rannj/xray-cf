@@ -277,8 +277,8 @@ gen_xray_config() {
             listen:"127.0.0.1",
             port:$port,
             protocol:"vless",
-            settings:{clients:[{id:$uid}],decryption:"none"},
-            streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path}},
+            settings:{users:[{id:$uid}],decryption:"none"},
+            streamSettings:{method:"xhttp",security:"none",xhttpSettings:{path:$path}},
             sniffing:{enabled:true,destOverride:["http","tls","quic"]}
         }],
         outbounds:[
@@ -292,12 +292,15 @@ gen_xray_config() {
 }
 
 write_xray_config() {
-    local content="$1" tmp
+    local content="$1" tmp validation_output
     mkdir -p "$XRAY_CONFIG_DIR"
     tmp=$(mktemp "$XRAY_CONFIG_DIR/.config.json.XXXXXX")
     printf '%s\n' "$content" > "$tmp"
-    "$XRAY_BINARY" run -test -config "$tmp" &>/dev/null \
-        || { rm -f "$tmp"; die "生成的 Xray 配置未通过校验"; }
+    if ! validation_output=$("$XRAY_BINARY" run -test -config "$tmp" 2>&1); then
+        printf '%s\n' "$validation_output" >&2
+        rm -f "$tmp"
+        die "生成的 Xray 配置未通过校验"
+    fi
     chmod 644 "$tmp"
     mv -f "$tmp" "$XRAY_CONFIG_PATH"
     ok "xray 配置已写入 $XRAY_CONFIG_PATH"
