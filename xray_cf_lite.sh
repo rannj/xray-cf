@@ -1,38 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── 常量 ──────────────────────────────────────────────
+# xray-cf-lite: VLESS + XHTTP over Cloudflare Tunnel
+
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 XRAY_CONFIG_PATH="$XRAY_CONFIG_DIR/config.json"
 XRAY_BINARY="/usr/local/bin/xray"
+XRAY_OPENRC_SCRIPT="/etc/init.d/xray"
+
 STATE_DIR="/etc/xray-cf-lite"
 STATE_PATH="$STATE_DIR/state.json"
-CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
+TUNNEL_TOKEN_PATH="$STATE_DIR/tunnel.token"
 LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
 
-CF_API="https://api.cloudflare.com/client/v4"
-MANAGED_PREFIX="xray-cf-lite "
+CLOUDFLARED_SERVICE="cloudflared-xray"
+CLOUDFLARED_SYSTEMD_PATH="/etc/systemd/system/${CLOUDFLARED_SERVICE}.service"
+CLOUDFLARED_OPENRC_PATH="/etc/init.d/${CLOUDFLARED_SERVICE}"
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-# ── 工具 ──────────────────────────────────────────────
-die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
-ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
-info()    { printf '\033[36m·\033[0m %s\n' "$*"; }
-need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
+
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
+info() { printf '\033[36m·\033[0m %s\n' "$*"; }
+need_cmd() { command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
 
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
         || die "无效端口: $port（有效范围 1-65535）"
-}
-
-write_file_atomic() {
-    local target="$1" mode="$2" content="$3" dir tmp
-    dir=$(dirname "$target")
-    mkdir -p "$dir"
-    tmp=$(mktemp "${dir}/.$(basename "$target").XXXXXX") || die "无法创建临时文件: $dir"
-    printf '%s\n' "$content" > "$tmp"
-    chmod "$mode" "$tmp"
-    mv -f "$tmp" "$target"
 }
 
 urlencode() {
@@ -47,9 +41,21 @@ urlencode() {
     done
 }
 
-gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
+write_file_atomic() {
+    local target="$1" mode="$2" content="$3" dir tmp
+    dir=$(dirname "$target")
+    mkdir -p "$dir"
+    tmp=$(mktemp "${dir}/.$(basename "$target").XXXXXX") || die "无法创建临时文件: $dir"
+    printf '%s\n' "$content" > "$tmp"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$target"
+}
 
-# ── init 系统检测 ─────────────────────────────────────
+gen_uuid() {
+    cat /proc/sys/kernel/random/uuid 2>/dev/null \
+        || uuidgen | tr '[:upper:]' '[:lower:]'
+}
+
 INIT_SYSTEM=""
 detect_init() {
     if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
@@ -61,15 +67,14 @@ detect_init() {
     fi
 }
 
-# ── 包管理器 ──────────────────────────────────────────
 install_deps() {
     local missing=()
-    command -v curl  &>/dev/null || missing+=(curl)
-    command -v jq    &>/dev/null || missing+=(jq)
+    command -v curl &>/dev/null || missing+=(curl)
+    command -v jq &>/dev/null || missing+=(jq)
     command -v unzip &>/dev/null || missing+=(unzip)
     [[ ${#missing[@]} -eq 0 ]] && return
 
-    echo "安装依赖: ${missing[*]}"
+    info "安装依赖: ${missing[*]}"
     if command -v apk &>/dev/null; then
         apk add --no-cache "${missing[@]}"
     elif command -v apt-get &>/dev/null; then
@@ -81,11 +86,22 @@ install_deps() {
     fi
 }
 
-# ── xray 服务管理 ────────────────────────────────────
-XRAY_OPENRC_SCRIPT="/etc/init.d/xray"
+CLOUDFLARED_BINARY=""
+check_cloudflared() {
+    CLOUDFLARED_BINARY=$(command -v cloudflared || true)
+    [[ -n "$CLOUDFLARED_BINARY" ]] \
+        || die "未找到 cloudflared；请先自行安装（脚本不会安装）"
 
-write_openrc_script() {
-    cat > "$XRAY_OPENRC_SCRIPT" << 'INITEOF'
+    local version
+    version=$($CLOUDFLARED_BINARY --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -1 || true)
+    [[ -n "$version" ]] || die "无法识别 cloudflared 版本"
+    [[ "$(printf '%s\n%s\n' "2025.4.0" "$version" | sort -V | head -1)" == "2025.4.0" ]] \
+        || die "cloudflared $version 过旧，--token-file 需要 2025.4.0 或更高版本"
+    info "cloudflared $version"
+}
+
+write_xray_openrc_script() {
+    cat > "$XRAY_OPENRC_SCRIPT" <<'EOF'
 #!/sbin/openrc-run
 name="xray"
 description="Xray proxy server"
@@ -95,406 +111,209 @@ command_background=true
 pidfile="/run/xray.pid"
 output_log="/var/log/xray.log"
 error_log="/var/log/xray.log"
-respawn_delay=1
-respawn_max=0
-respawn_period=86400
-supervise_daemon_args="--respawn-delay ${respawn_delay} --respawn-max ${respawn_max} --respawn-period ${respawn_period}"
 supervisor=supervise-daemon
+supervise_daemon_args="--respawn-delay 1 --respawn-max 0 --respawn-period 86400"
 depend() { need net; after firewall; }
-INITEOF
+EOF
     chmod +x "$XRAY_OPENRC_SCRIPT"
 }
 
-svc_enable()    { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl enable xray &>/dev/null; else rc-update add xray default &>/dev/null; fi; true; }
-svc_start()     { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else [[ -f "$XRAY_OPENRC_SCRIPT" ]] || write_openrc_script; rc-service xray restart; fi; }
-svc_stop()      { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl stop xray &>/dev/null; systemctl disable xray &>/dev/null; else rc-service xray stop &>/dev/null; rc-update del xray default &>/dev/null; fi; true; }
-svc_is_active() { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active xray &>/dev/null; else rc-service xray status &>/dev/null 2>&1; fi; }
-
-ensure_systemd_restart() {
-    # 确保 systemd 下 xray 崩溃自动重启
+ensure_systemd_xray_restart() {
+    [[ "$INIT_SYSTEM" == "systemd" ]] || return
     local drop="/etc/systemd/system/xray.service.d"
-    if [[ "$INIT_SYSTEM" == "systemd" && ! -f "$drop/restart.conf" ]]; then
-        mkdir -p "$drop"
-        cat > "$drop/restart.conf" << 'SDEOF'
+    mkdir -p "$drop"
+    cat > "$drop/restart.conf" <<'EOF'
 [Service]
 Restart=on-failure
 RestartSec=1
-SDEOF
-        systemctl daemon-reload
-    fi
+EOF
+    systemctl daemon-reload
 }
 
-restart_xray() {
-    [[ "$INIT_SYSTEM" == "systemd" ]] && ensure_systemd_restart
-    svc_enable
-    svc_start || die "xray 重启失败"
-    sleep 1
-    svc_is_active || die "xray 未正常启动，请查看日志"
+xray_start() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        ensure_systemd_xray_restart
+        systemctl enable xray &>/dev/null
+        systemctl restart xray
+        systemctl is-active xray &>/dev/null || die "xray 未正常启动"
+    else
+        [[ -f "$XRAY_OPENRC_SCRIPT" ]] || write_xray_openrc_script
+        rc-update add xray default &>/dev/null
+        rc-service xray restart
+        rc-service xray status &>/dev/null 2>&1 || die "xray 未正常启动"
+    fi
     ok "xray 服务已启动"
 }
 
-stop_xray() { svc_stop; }
-
-# ── 网络检测 ─────────────────────────────────────────
-get_public_ip() {
-    local ip
-    for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
-        ip=$(curl -sf --max-time 8 "$url" 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return
-    done
-    die "获取公网 IPv4 失败"
-}
-
-detect_nat() {
-    local public_ip
-    public_ip=$(get_public_ip)
-    if ip addr show 2>/dev/null | grep -q "inet ${public_ip}/"; then
-        echo "direct"
+xray_stop() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl stop xray &>/dev/null || true
+        systemctl disable xray &>/dev/null || true
     else
-        echo "nat"
+        rc-service xray stop &>/dev/null || true
+        rc-update del xray default &>/dev/null || true
     fi
 }
 
-get_listening_ports() {
-    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '
-}
-
-rand_port() {
-    local existing="$1" p
-    while true; do
-        p=$(( RANDOM % 50000 + 10000 ))
-        echo "$existing" | grep -qw "$p" || { echo "$p"; return; }
-    done
-}
-
-# ── CF API ────────────────────────────────────────────
-cf_call() {
-    local method="$1" endpoint="$2" data="${3:-}"
-    local args=(-sS -f --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    [[ -n "$data" ]] && args+=(-d "$data")
-    curl "${args[@]}" "${CF_API}${endpoint}"
-}
-
-cf_call_raw() {
-    local method="$1" endpoint="$2" data="${3:-}"
-    local args=(-sS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    [[ -n "$data" ]] && args+=(-d "$data")
-    curl "${args[@]}" "${CF_API}${endpoint}"
-}
-
-# ── CF 凭据 ───────────────────────────────────────────
-CF_EMAIL="" CF_KEY=""
-
-load_cf_account() {
-    [[ -f "$CF_ACCOUNT_PATH" ]] || return 1
-    CF_EMAIL=$(jq -r '.email // ""' "$CF_ACCOUNT_PATH")
-    CF_KEY=$(jq -r '.api_key // ""' "$CF_ACCOUNT_PATH")
-    [[ -n "$CF_EMAIL" && -n "$CF_KEY" ]]
-}
-
-save_cf_account() {
-    mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
-    write_file_atomic "$CF_ACCOUNT_PATH" 600 \
-        "$(jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" '{email:$e,api_key:$k}')"
-}
-
-# 验证 CF 凭据是否有效（用 verify 接口，避免拿到无效 key 继续跑）
-cf_verify_credentials() {
-    local r
-    r=$(curl -s -X GET "${CF_API}/user/tokens/verify" \
-        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    # Global API Key 在 tokens/verify 上可能不适用，回退到列 zones 验证
-    if echo "$r" | jq -e '.success == true' &>/dev/null; then
-        return 0
-    fi
-    r=$(curl -s -X GET "${CF_API}/zones?per_page=1" \
-        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    echo "$r" | jq -e '.success == true' &>/dev/null
-}
-
-prompt_cf() {
-    # 先尝试复用已保存凭据
-    if load_cf_account; then
-        local masked="${CF_KEY:0:6}...${CF_KEY: -4}"
-        read -rp "复用已保存 CF 凭据 ($CF_EMAIL, Key=$masked)? (Y/n): " ans
-        if [[ "${ans,,}" =~ ^(|y|yes)$ ]]; then
-            if cf_verify_credentials; then
-                return 0
-            fi
-            echo "已保存的 CF 凭据校验失败，请重新输入"
-        fi
-    fi
-    # 循环让用户输入直到校验通过
-    while true; do
-        read -rp "Cloudflare 邮箱: " CF_EMAIL || die "输入已中断"
-        read -rsp "Cloudflare Global API Key: " CF_KEY || die "输入已中断"; echo
-        if [[ -z "$CF_EMAIL" || -z "$CF_KEY" ]]; then
-            echo "邮箱和 API Key 不能为空，请重试"
-            continue
-        fi
-        echo -n "校验凭据... "
-        if cf_verify_credentials; then
-            echo "通过"
-            save_cf_account
-            return 0
-        fi
-        echo "失败：邮箱或 API Key 错误，请重新输入（Ctrl+C 退出）"
-    done
-}
-
-# ── CF DNS / SSL / Origin Rules ───────────────────────
-cf_find_zone() {
-    local domain="$1" zones best_name="" best_id=""
-    zones=$(cf_call GET "/zones?per_page=100" | jq -r '.result[] | "\(.name) \(.id)"')
-    while IFS=' ' read -r zone_name zone_id; do
-        if [[ "$domain" == "$zone_name" || "$domain" == *".$zone_name" ]]; then
-            [[ ${#zone_name} -gt ${#best_name} ]] && best_name="$zone_name" && best_id="$zone_id"
-        fi
-    done <<< "$zones"
-    [[ -n "$best_id" ]] || return 1
-    echo "$best_id"
-}
-
-cf_get_dns() {
-    cf_call GET "/zones/$1/dns_records?type=A&name=$2" | jq '.result[0] // empty'
-}
-
-cf_upsert_dns() {
-    local zone_id="$1" domain="$2" ip="$3"
-    local payload existing
-    payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:true,ttl:1}')
-    existing=$(cf_get_dns "$zone_id" "$domain")
-    if [[ -n "$existing" ]]; then
-        local rid; rid=$(echo "$existing" | jq -r '.id')
-        cf_call PUT "/zones/${zone_id}/dns_records/${rid}" "$payload" | jq -r '.result.id'
+xray_is_active() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl is-active xray &>/dev/null
     else
-        cf_call POST "/zones/${zone_id}/dns_records" "$payload" | jq -r '.result.id'
+        rc-service xray status &>/dev/null 2>&1
     fi
 }
 
-cf_get_ssl()  { cf_call GET "/zones/$1/settings/ssl" | jq -r '.result.value'; }
-cf_set_ssl()  { cf_call PATCH "/zones/$1/settings/ssl" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
+write_cloudflared_service() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        cat > "$CLOUDFLARED_SYSTEMD_PATH" <<EOF
+[Unit]
+Description=Cloudflare Tunnel for xray-cf-lite
+After=network-online.target xray.service
+Wants=network-online.target
+Requires=xray.service
 
-# ── CF 安全规则 ───────────────────────────────────────
-cf_get_security_level() { cf_call GET "/zones/$1/settings/security_level" | jq -r '.result.value'; }
-cf_set_security_level() { cf_call PATCH "/zones/$1/settings/security_level" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
+[Service]
+Type=simple
+ExecStart=$CLOUDFLARED_BINARY tunnel --no-autoupdate run --token-file $TUNNEL_TOKEN_PATH
+Restart=on-failure
+RestartSec=2
 
-cf_get_browser_check() { cf_call GET "/zones/$1/settings/browser_check" | jq -r '.result.value'; }
-cf_set_browser_check() { cf_call PATCH "/zones/$1/settings/browser_check" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
-
-cf_get_bot_management() { cf_call_raw GET "/zones/$1/bot_management" | jq '.result // {}'; }
-
-cf_set_bot_fight_off() {
-    local zone_id="$1"
-    cf_call_raw PUT "/zones/${zone_id}/bot_management" "$(jq -n '{
-        enable_js: false,
-        sbfm_likely_automated: "allow",
-        sbfm_definitely_automated: "allow",
-        sbfm_verified_bots: "allow",
-        sbfm_static_resource_protection: false
-    }')" | jq -e '.success' &>/dev/null
-}
-
-cf_restore_bot_management() {
-    local zone_id="$1" backup="$2"
-    # 只恢复我们改过的字段
-    local payload
-    payload=$(echo "$backup" | jq '{
-        enable_js: .enable_js,
-        sbfm_likely_automated: .sbfm_likely_automated,
-        sbfm_definitely_automated: .sbfm_definitely_automated,
-        sbfm_verified_bots: .sbfm_verified_bots,
-        sbfm_static_resource_protection: .sbfm_static_resource_protection
-    }')
-    cf_call_raw PUT "/zones/${zone_id}/bot_management" "$payload" | jq -e '.success' &>/dev/null
-}
-
-# 安装时：备份安全设置 -> 关闭拦截
-cf_relax_security() {
-    local zone_id="$1"
-    local sec_level bot_mgmt browser_check
-
-    sec_level=$(cf_get_security_level "$zone_id")
-    browser_check=$(cf_get_browser_check "$zone_id")
-    bot_mgmt=$(cf_get_bot_management "$zone_id")
-
-    # 降低 security level
-    if [[ "$sec_level" != "essentially_off" ]]; then
-        cf_set_security_level "$zone_id" "essentially_off"
-        ok "Security Level: essentially_off" >&2
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    else
+        cat > "$CLOUDFLARED_OPENRC_PATH" <<EOF
+#!/sbin/openrc-run
+name="$CLOUDFLARED_SERVICE"
+description="Cloudflare Tunnel for xray-cf-lite"
+command="$CLOUDFLARED_BINARY"
+command_args="tunnel --no-autoupdate run --token-file $TUNNEL_TOKEN_PATH"
+command_background=true
+pidfile="/run/$CLOUDFLARED_SERVICE.pid"
+output_log="/var/log/$CLOUDFLARED_SERVICE.log"
+error_log="/var/log/$CLOUDFLARED_SERVICE.log"
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-delay 2 --respawn-max 0 --respawn-period 86400"
+depend() { need net; after xray; }
+EOF
+        chmod +x "$CLOUDFLARED_OPENRC_PATH"
     fi
+}
 
-    # 关闭 Browser Integrity Check
-    if [[ "$browser_check" != "off" ]]; then
-        cf_set_browser_check "$zone_id" "off"
-        ok "Browser Check: off" >&2
+cloudflared_start() {
+    write_cloudflared_service
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl enable "$CLOUDFLARED_SERVICE" &>/dev/null
+        systemctl restart "$CLOUDFLARED_SERVICE"
+        sleep 2
+        systemctl is-active "$CLOUDFLARED_SERVICE" &>/dev/null \
+            || die "cloudflared-xray 启动失败，请查看 journalctl -u $CLOUDFLARED_SERVICE"
+    else
+        rc-update add "$CLOUDFLARED_SERVICE" default &>/dev/null
+        rc-service "$CLOUDFLARED_SERVICE" restart
+        sleep 2
+        rc-service "$CLOUDFLARED_SERVICE" status &>/dev/null 2>&1 \
+            || die "cloudflared-xray 启动失败，请查看 /var/log/$CLOUDFLARED_SERVICE.log"
     fi
+    ok "Cloudflare Tunnel 服务已启动"
+}
 
-    # 关闭 Bot Fight Mode
-    local sbfm_likely
-    sbfm_likely=$(echo "$bot_mgmt" | jq -r '.sbfm_likely_automated // ""')
-    if [[ "$sbfm_likely" != "allow" ]]; then
-        cf_set_bot_fight_off "$zone_id"
-        ok "Bot Fight Mode: 已关闭" >&2
+cloudflared_stop() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl stop "$CLOUDFLARED_SERVICE" &>/dev/null || true
+        systemctl disable "$CLOUDFLARED_SERVICE" &>/dev/null || true
+        rm -f "$CLOUDFLARED_SYSTEMD_PATH"
+        systemctl daemon-reload
+    else
+        rc-service "$CLOUDFLARED_SERVICE" stop &>/dev/null || true
+        rc-update del "$CLOUDFLARED_SERVICE" default &>/dev/null || true
+        rm -f "$CLOUDFLARED_OPENRC_PATH"
     fi
-
-    # 返回备份 JSON
-    jq -n --arg sl "$sec_level" --arg bc "$browser_check" --argjson bm "$bot_mgmt"         '{security_level:$sl, browser_check:$bc, bot_management:$bm}'
 }
 
-# 卸载时：恢复安全设置
-cf_restore_security() {
-    local zone_id="$1" backup="$2"
-    [[ -z "$backup" || "$backup" == "null" ]] && return
-
-    local sl bc bm
-    sl=$(echo "$backup" | jq -r '.security_level // ""')
-    bc=$(echo "$backup" | jq -r '.browser_check // ""')
-    bm=$(echo "$backup" | jq '.bot_management // null')
-
-    [[ -n "$sl" ]] && cf_set_security_level "$zone_id" "$sl" && ok "Security Level 已恢复: $sl"
-    [[ -n "$bc" ]] && cf_set_browser_check "$zone_id" "$bc" && ok "Browser Check 已恢复: $bc"
-    [[ "$bm" != "null" ]] && cf_restore_bot_management "$zone_id" "$bm" && ok "Bot Fight Mode 已恢复"
+cloudflared_is_active() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl is-active "$CLOUDFLARED_SERVICE" &>/dev/null
+    else
+        rc-service "$CLOUDFLARED_SERVICE" status &>/dev/null 2>&1
+    fi
 }
 
-cf_get_origin_rules() {
-    local r; r=$(cf_call_raw GET "/zones/$1/rulesets/phases/http_request_origin/entrypoint")
-    echo "$r" | jq -r 'if .success then .result.rules // [] else [] end' 2>/dev/null || echo '[]'
-}
-
-cf_put_origin_rules() {
-    local r; r=$(cf_call_raw PUT "/zones/$1/rulesets/phases/http_request_origin/entrypoint" \
-        "$(jq -n --argjson r "$2" '{rules:$r}')")
-    echo "$r" | jq -e '.success' &>/dev/null || die "Origin Rules 写入失败: $(echo "$r" | jq -c '.errors')"
-}
-
-# cf_port = 外部端口（CF Origin Rules 转发的目标端口）
-build_new_origin_rules() {
-    local domain="$1" routes_json="$2"
-    echo "$routes_json" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
-        .[] | {
-            description: ($pfx + .protocol + " " + .path),
-            enabled: true,
-            expression: ("(http.host eq \"" + $d + "\" and (http.request.uri.path eq \"" + .path + "\" or starts_with(http.request.uri.path, \"" + .path + "/\")))"),
-            action: "route",
-            action_parameters: { origin: { port: .cf_port } }
-        }
-    ]'
-}
-
-apply_origin_rules() {
-    local zone_id="$1" domain="$2" routes_json="$3"
-    local existing kept new_managed merged
-    existing=$(cf_get_origin_rules "$zone_id")
-    kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
-        .[] | select(
-            (.description | startswith($pfx) | not) or
-            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
-        )
-    ]')
-    new_managed=$(build_new_origin_rules "$domain" "$routes_json")
-    merged=$(jq -n --argjson a "$kept" --argjson b "$new_managed" '$a + $b')
-    cf_put_origin_rules "$zone_id" "$merged"
-}
-
-# ── xray 安装 ─────────────────────────────────────────
 install_xray() {
     echo "正在安装 xray-core ..."
-
-    # 优先尝试官方安装脚本（需要 systemd）
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        if bash -c "curl -fsSL $XRAY_INSTALL_URL | bash -s -- install" 2>/dev/null; then
-            [[ -f "$XRAY_BINARY" ]] && { ok "xray-core 安装完成"; return; }
+        if curl -fsSL "$XRAY_INSTALL_URL" | bash -s -- install; then
+            [[ -x "$XRAY_BINARY" ]] && { ok "xray-core 安装完成"; return; }
         fi
     fi
 
-    # 回退：手动下载二进制
-    info "使用手动安装方式"
-    local arch
+    local arch version tmp
     case "$(uname -m)" in
         x86_64|amd64) arch="64" ;;
         aarch64|arm64) arch="arm64-v8a" ;;
-        armv7*)        arch="arm32-v7a" ;;
-        *)             die "不支持的架构: $(uname -m)" ;;
+        armv7*) arch="arm32-v7a" ;;
+        *) die "不支持的架构: $(uname -m)" ;;
     esac
+    version=$(curl -fsSL --retry 2 --connect-timeout 10 \
+        https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name')
+    [[ -n "$version" && "$version" != "null" ]] || die "获取 xray 版本失败"
 
-    local ver
-    ver=$(curl -sf "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r '.tag_name') || die "获取 xray 版本失败"
-    info "xray $ver ($arch)"
-
-    local tmp="/tmp/xray-install-$$"
-    mkdir -p "$tmp"
-    curl -fsSL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch}.zip" || die "下载失败"
-
-    command -v unzip &>/dev/null || {
-        command -v apk &>/dev/null && apk add --no-cache unzip
-        command -v apt-get &>/dev/null && apt-get install -y -qq unzip
-    }
-
-    unzip -o "$tmp/xray.zip" xray -d /usr/local/bin/ || die "解压失败"
+    tmp=$(mktemp -d /tmp/xray-install.XXXXXX)
+    curl -fsSL --retry 2 --connect-timeout 10 -o "$tmp/xray.zip" \
+        "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-${arch}.zip"
+    unzip -o "$tmp/xray.zip" xray -d /usr/local/bin/
     chmod +x "$XRAY_BINARY"
     rm -rf "$tmp"
-
-    # 下载 geodata
-    local geo_dir="/usr/local/share/xray"
-    mkdir -p "$geo_dir"
-    for f in geoip.dat geosite.dat; do
-        [[ -f "$geo_dir/$f" ]] || curl -fsSL -o "$geo_dir/$f" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$f" 2>/dev/null || true
-    done
-
-    [[ -f "$XRAY_BINARY" ]] || die "安装后未找到 xray"
     ok "xray-core 安装完成: $($XRAY_BINARY version | head -1)"
 }
 
-# ── xray 配置生成 ─────────────────────────────────────
 gen_xray_config() {
-    local routes_json="$1" uid="$2"
-    local inbounds
-    inbounds=$(echo "$routes_json" | jq --arg uid "$uid" '[
-        .[] | {
-            tag: ("in-vless-xhttp-" + (.listen_port|tostring)),
-            listen: "0.0.0.0",
-            port: .listen_port,
-            protocol: "vless",
-            settings: {clients:[{id:$uid}],decryption:"none"},
-            streamSettings: {network:"xhttp",security:"none",xhttpSettings:{path:.path}},
-            sniffing: {enabled:true,destOverride:["http","tls","quic"]}
-        }
-    ]')
-    jq -n --argjson inb "$inbounds" '{
+    local port="$1" uid="$2" path="$3"
+    jq -n --argjson port "$port" --arg uid "$uid" --arg path "$path" '{
         log:{loglevel:"warning"},
-        inbounds:$inb,
-        outbounds:[{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
-        routing:{domainStrategy:"AsIs",rules:[{type:"field",outboundTag:"block",protocol:["bittorrent"]}]}
+        inbounds:[{
+            tag:"in-vless-xhttp",
+            listen:"127.0.0.1",
+            port:$port,
+            protocol:"vless",
+            settings:{clients:[{id:$uid}],decryption:"none"},
+            streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path}},
+            sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+        }],
+        outbounds:[
+            {tag:"direct",protocol:"freedom"},
+            {tag:"block",protocol:"blackhole"}
+        ],
+        routing:{domainStrategy:"AsIs",rules:[
+            {type:"field",outboundTag:"block",protocol:["bittorrent"]}
+        ]}
     }'
 }
 
 write_xray_config() {
-    write_file_atomic "$XRAY_CONFIG_PATH" 644 "$1"
+    local content="$1" tmp
+    mkdir -p "$XRAY_CONFIG_DIR"
+    tmp=$(mktemp "$XRAY_CONFIG_DIR/.config.json.XXXXXX")
+    printf '%s\n' "$content" > "$tmp"
+    "$XRAY_BINARY" run -test -config "$tmp" &>/dev/null \
+        || { rm -f "$tmp"; die "生成的 Xray 配置未通过校验"; }
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$XRAY_CONFIG_PATH"
     ok "xray 配置已写入 $XRAY_CONFIG_PATH"
 }
 
-# ── 订阅链接 ─────────────────────────────────────────
 build_link() {
-    local uid="$1" domain="$2" path="$3"
-    local query name
+    local uid="$1" domain="$2" path="$3" query name
     query="encryption=none&security=tls&sni=$(urlencode "$domain")&fp=chrome&type=xhttp&path=$(urlencode "$path")&mode=stream-up"
-    name=$(urlencode "VLESS XHTTP ${domain}")
-    echo "vless://${uid}@${domain}:443?${query}#${name}"
+    name=$(urlencode "VLESS XHTTP Tunnel ${domain}")
+    printf 'vless://%s@%s:443?%s#%s\n' "$uid" "$domain" "$query" "$name"
 }
 
-gen_all_links() {
-    local uid="$1" domain="$2" routes_json="$3"
-    local path link
-    path=$(echo "$routes_json" | jq -r '.[0].path')
-    link=$(build_link "$uid" "$domain" "$path")
-    jq -n --arg link "$link" '{vless_xhttp:$link}'
-}
-
-# ── 状态 ──────────────────────────────────────────────
 load_state() { [[ -f "$STATE_PATH" ]] && jq -e '.' "$STATE_PATH"; }
 load_existing_state() {
     [[ -f "$STATE_PATH" ]] || die "未检测到部署"
-    load_state 2>/dev/null || die "状态文件损坏: $STATE_PATH（请勿重新安装覆盖现场）"
+    load_state 2>/dev/null || die "状态文件损坏: $STATE_PATH"
 }
 save_state() {
     local state_json="$1"
@@ -502,479 +321,201 @@ save_state() {
     mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
     write_file_atomic "$STATE_PATH" 600 "$state_json"
 }
-remove_state() { rm -f "$STATE_PATH"; }
 
-save_links_snapshot() {
-    local domain="$1" uid="$2" links_json="$3"
-    local content
-    content=$(printf '域名: %s\nUUID: %s\n\n' "$domain" "$uid"
-        echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"')
-    write_file_atomic "$LAST_LINKS_PATH" 600 "$content"
-}
-
-print_links() {
-    local links_json="$1"
-    local proto link
-    while IFS=$'\t' read -r proto link; do
-        echo "  VLESS XHTTP 节点 $link"
-    done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
-}
-
-# ── 交互辅助 ─────────────────────────────────────────
 prompt_uuid() {
-    local uid
-    read -rp "UUID(留空=自动生成): " custom_uuid
-    if [[ -n "$custom_uuid" ]]; then
-        [[ "$custom_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
-        uid="${custom_uuid,,}"
+    local value
+    read -rp "UUID(留空=自动生成): " value
+    if [[ -n "$value" ]]; then
+        [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+            || die "UUID 格式不正确"
+        printf '%s\n' "${value,,}"
     else
-        uid=$(gen_uuid)
+        gen_uuid
     fi
-    echo "$uid"
 }
 
-prompt_path_prefix() {
-    local default="$1"
-    read -rp "XHTTP 路径(留空=/${default}): " pfx
-    [[ -z "$pfx" ]] && pfx="/${default}"
-    [[ "$pfx" == /* ]] || pfx="/${pfx}"
-    echo "$pfx"
+prompt_path() {
+    local default="$1" value
+    read -rp "XHTTP 路径(留空=/${default}): " value
+    [[ -n "$value" ]] || value="/${default}"
+    [[ "$value" == /* ]] || value="/$value"
+    printf '%s\n' "$value"
 }
 
-# 生成路由 JSON，NAT 和直连通用
-# NAT 时 xray 监听 listen_port(内部)，CF 转发到 cf_port(外部)
-# 直连时 listen_port == cf_port
-build_routes() {
-    local net_mode="$1" path="$2" listen_port cf_port
-
-    if [[ "$net_mode" == "nat" ]]; then
-        echo >&2
-        info "NAT 模式: 配置 VLESS XHTTP 端口映射" >&2
-        echo >&2
-        read -rp "内部监听端口(xray监听): " listen_port
-        validate_port "$listen_port"
-        read -rp "外部映射端口(对外暴露): " cf_port
-        validate_port "$cf_port"
-    else
-        read -rp "自定义端口?(留空=随机): " listen_port
-        if [[ -n "$listen_port" ]]; then
-            listen_port="${listen_port// /}"
-            validate_port "$listen_port"
-        else
-            listen_port=$(rand_port "$(get_listening_ports)")
-        fi
-        cf_port="$listen_port"
-    fi
-
-    jq -n --argjson lp "$((listen_port))" --argjson cp "$((cf_port))" --arg path "$path" \
-        '[{protocol:"vless",transport:"xhttp",listen_port:$lp,cf_port:$cp,path:$path}]'
-}
-
-# ── 1. 安装 ──────────────────────────────────────────
 do_install() {
-    local state
-    if [[ -f "$STATE_PATH" ]]; then
-        state=$(load_state 2>/dev/null) || die "状态文件损坏: $STATE_PATH（请先修复或备份现场）"
-    else
-        state=""
-    fi
-    [[ -n "$state" ]] && die "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"
+    [[ ! -f "$STATE_PATH" ]] || die "检测到已有部署，请先卸载"
+    check_cloudflared
+    [[ -x "$XRAY_BINARY" ]] || install_xray
 
-    [[ -f "$XRAY_BINARY" ]] && ok "xray-core 已安装" || install_xray
+    local domain port uid path token link config state_json
+    read -rp "Tunnel 公开域名: " domain
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "域名格式不正确"
 
-    local net_mode
-    net_mode=$(detect_nat)
-    [[ "$net_mode" == "nat" ]] && info "检测到 NAT 环境（内网 IP）" || info "直连环境"
+    read -rp "Xray 本地端口(留空=8080): " port
+    [[ -n "$port" ]] || port=8080
+    validate_port "$port"
 
-    prompt_cf
-
-    # 输入域名并校验能匹配到 CF Zone，失败可重输
-    local domain zone_id
-    while true; do
-        read -rp "绑定域名: " domain || die "输入已中断"
-        if [[ -z "$domain" ]]; then
-            echo "域名不能为空，请重试"
-            continue
-        fi
-        if zone_id=$(cf_find_zone "$domain"); then
-            info "匹配到 Zone: $zone_id"
-            break
-        fi
-        echo "无法在该 CF 账号下匹配 Zone: $domain，请确认域名已托管并重输（Ctrl+C 退出）"
-    done
-
-    local uid
     uid=$(prompt_uuid)
-    local short_id="${uid:0:8}"
-    local path_prefix
-    path_prefix=$(prompt_path_prefix "$short_id")
-
-    local routes_json
-    routes_json=$(build_routes "$net_mode" "$path_prefix")
-
-    # 预览
+    path=$(prompt_path "${uid:0:8}")
+    read -rsp "Cloudflare Tunnel Token: " token || die "输入已中断"
     echo
-    echo "配置预览:"
-    echo "  域名:  $domain"
-    echo "  UUID:  $uid"
-    echo "  模式:  $net_mode"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
+    [[ -n "$token" ]] || die "Tunnel Token 不能为空"
+
     echo
-    read -rp "确认部署? (Y/n): " confirm
+    echo "请确认 Dashboard 中 Published application 配置为:"
+    echo "  Hostname: $domain"
+    echo "  Service:  http://127.0.0.1:$port"
+    echo "  Path:     留空（XHTTP 路径由 Xray 校验）"
+    read -rp "确认继续? (Y/n): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
 
-    # xray
-    local config
-    config=$(gen_xray_config "$routes_json" "$uid")
+    config=$(gen_xray_config "$port" "$uid" "$path")
     write_xray_config "$config"
-    [[ "$INIT_SYSTEM" == "openrc" && ! -f "$XRAY_OPENRC_SCRIPT" ]] && write_openrc_script && ok "OpenRC 服务脚本已创建"
-    restart_xray
+    write_file_atomic "$TUNNEL_TOKEN_PATH" 600 "$token"
+    unset token
 
-    # CF
-    local public_ip dns_before ssl_before origin_rules_before dns_record_id
-    public_ip=$(get_public_ip)
-    dns_before=$(cf_get_dns "$zone_id" "$domain" || echo "null")
-    [[ "$dns_before" == "" ]] && dns_before="null"
-    ssl_before=$(cf_get_ssl "$zone_id")
-    origin_rules_before=$(cf_get_origin_rules "$zone_id")
+    xray_start
+    cloudflared_start
 
-    dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
-    ok "DNS A 记录: $domain -> $public_ip (已代理)"
-    cf_set_ssl "$zone_id" "flexible"
-    ok "SSL 模式: flexible"
-    apply_origin_rules "$zone_id" "$domain" "$routes_json"
-    ok "Origin Rules: 1 条"
-
-    # 安全规则：关闭可能拦截 XHTTP 请求的设置
-    local security_backup
-    security_backup=$(cf_relax_security "$zone_id")
-    echo "$security_backup" | jq -e '.' &>/dev/null || die "安全规则备份不是有效 JSON"
-
-    # 订阅
-    local links_json
-    links_json=$(gen_all_links "$uid" "$domain" "$routes_json")
-    save_links_snapshot "$domain" "$uid" "$links_json"
-
-    # 状态
-    local dns_existed="false"
-    [[ "$dns_before" != "null" ]] && dns_existed="true"
-    local state_json
+    link=$(build_link "$uid" "$domain" "$path")
     state_json=$(jq -n \
-        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
-        --argjson routes "$routes_json" \
-        --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
-        --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
-        --argjson secbk "$security_backup" \
-        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,transport:"xhttp",routes:$routes,
-          managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
-          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}') \
+        --arg domain "$domain" --arg uid "$uid" --arg path "$path" \
+        --argjson port "$port" --arg link "$link" \
+        '{domain:$domain,uuid:$uid,path:$path,local_port:$port,transport:"xhttp",tunnel:true,link:$link}') \
         || die "生成部署状态失败"
     save_state "$state_json"
+    write_file_atomic "$LAST_LINKS_PATH" 600 "域名: $domain
+UUID: $uid
+VLESS XHTTP 节点 $link"
 
     echo
-    ok "部署完成"
-    print_links "$links_json"
-    echo
-    echo "订阅已保存到 $LAST_LINKS_PATH"
+    ok "部署完成（Xray 仅监听 127.0.0.1:$port）"
+    echo "  VLESS XHTTP 节点 $link"
 }
 
-# ── 2. 卸载 ──────────────────────────────────────────
 do_uninstall() {
+    load_existing_state >/dev/null
+    cloudflared_stop
+    xray_stop
+    rm -f "$XRAY_CONFIG_PATH" "$STATE_PATH" "$TUNNEL_TOKEN_PATH" "$LAST_LINKS_PATH"
+    ok "已删除本地 Xray/Tunnel 服务配置和 Token"
+    info "Dashboard 中的 Tunnel 与 Published application 未删除"
+}
+
+do_show() {
+    if [[ -f "$LAST_LINKS_PATH" ]]; then
+        cat "$LAST_LINKS_PATH"
+        return
+    fi
     local state
     state=$(load_existing_state)
-
-    local domain; domain=$(echo "$state" | jq -r '.domain')
-    echo "正在卸载: $domain"
-
-    stop_xray; rm -f "$XRAY_CONFIG_PATH"
-    ok "xray 已停止"
-
-    if load_cf_account; then
-        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
-        if [[ -n "$zone_id" ]]; then
-            cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
-            ok "Origin Rules 已恢复"
-
-            local ssl_bk; ssl_bk=$(echo "$state" | jq -r '.ssl_backup // ""')
-            [[ -n "$ssl_bk" ]] && cf_set_ssl "$zone_id" "$ssl_bk" && ok "SSL: $ssl_bk"
-
-            local dns_existed record_id
-            dns_existed=$(echo "$state" | jq -r '.dns_backup.existed')
-            record_id=$(echo "$state" | jq -r '.managed_dns_record_id // ""')
-            if [[ "$dns_existed" == "true" ]]; then
-                local rp; rp=$(echo "$state" | jq '.dns_backup.record | {type:(.type//"A"),name:(.name//""),content:(.content//""),proxied:(.proxied//false),ttl:(.ttl//1)}')
-                cf_call PUT "/zones/${zone_id}/dns_records/${record_id}" "$rp" >/dev/null
-                ok "DNS 已恢复"
-            elif [[ -n "$record_id" ]]; then
-                cf_call_raw DELETE "/zones/${zone_id}/dns_records/${record_id}" >/dev/null 2>&1 || true
-                ok "DNS 已删除"
-            fi
-            # 恢复安全规则
-            local sec_bk; sec_bk=$(echo "$state" | jq '.security_backup // null')
-            cf_restore_security "$zone_id" "$sec_bk"
-        fi
-    else
-        echo "无 CF 凭据，跳过恢复"
-    fi
-
-    remove_state
-    rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
-    ok "已清理订阅快照与 CF 凭据"
-    ok "卸载完成"
+    echo "$state" | jq -r '"VLESS XHTTP 节点 " + .link'
 }
 
-# ── 3. 查看订阅 ──────────────────────────────────────
-do_show() {
-    if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
-    local state; state=$(load_existing_state)
-    echo "域名: $(echo "$state" | jq -r '.domain')"
-    echo "UUID: $(echo "$state" | jq -r '.uuid')"
-    echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
-}
-
-# ── 4. 修改配置 ──────────────────────────────────────
 do_modify() {
-    local state; state=$(load_existing_state)
-    [[ "$(echo "$state" | jq -r '.transport // ""')" == "xhttp" ]] \
-        || die "检测到旧版非 XHTTP 部署，请先卸载后重新安装"
-
-    local domain uid routes_json net_mode
+    local state domain port uid path choice new_uid new_path link config
+    state=$(load_existing_state)
     domain=$(echo "$state" | jq -r '.domain')
+    port=$(echo "$state" | jq -r '.local_port')
     uid=$(echo "$state" | jq -r '.uuid')
-    routes_json=$(echo "$state" | jq '.routes')
-    net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
+    path=$(echo "$state" | jq -r '.path')
 
-    echo
-    echo "当前配置 ($net_mode):"
-    echo "  域名: $domain  UUID: $uid"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
-    echo
-    echo "  1. 修改 UUID"
-    echo "  2. 修改端口"
-    echo "  3. 修改 XHTTP 路径"
-    echo "  4. 全部修改"
-    echo "  0. 返回"
-    echo
-    read -rp "请选择 [0-4]: " mc
+    echo "1. 修改 UUID"
+    echo "2. 修改 XHTTP 路径"
+    echo "3. 同时修改"
+    echo "0. 返回"
+    read -rp "请选择 [0-3]: " choice
+    [[ "$choice" =~ ^[0-3]$ ]] || die "无效选项"
+    [[ "$choice" == 0 ]] && return
 
-    local new_uid="$uid" new_routes="$routes_json" changed=false
-
-    [[ "$mc" =~ ^[0-4]$ ]] || die "无效选项"
-    [[ "$mc" == "0" ]] && return
-
-    if [[ "$mc" == "1" || "$mc" == "4" ]]; then
-        read -rp "新 UUID(留空=重新生成): " iu
-        if [[ -n "$iu" ]]; then
-            [[ "$iu" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
-            new_uid="${iu,,}"
-        else
-            new_uid=$(gen_uuid)
-        fi
-        changed=true; ok "UUID: $new_uid"
+    new_uid="$uid"; new_path="$path"
+    if [[ "$choice" == 1 || "$choice" == 3 ]]; then
+        new_uid=$(prompt_uuid)
+    fi
+    if [[ "$choice" == 2 || "$choice" == 3 ]]; then
+        new_path=$(prompt_path "${new_uid:0:8}")
     fi
 
-    if [[ "$mc" == "2" || "$mc" == "4" ]]; then
-        local pc; pc=$(echo "$new_routes" | jq 'length')
-        if [[ "$net_mode" == "nat" ]]; then
-            echo "当前映射: $(echo "$new_routes" | jq -r '[.[] | "\(.listen_port):\(.cf_port)"] | join(",")')"
-            read -rp "新端口映射(内部:外部，共${pc}组，留空=不改): " mr
-            if [[ -n "$mr" ]]; then
-                IFS=',' read -ra maps <<< "$mr"
-                [[ ${#maps[@]} -eq $pc ]] || die "数量不匹配"
-                local idx=0
-                for m in "${maps[@]}"; do
-                    m="${m// /}"; local lp="${m%%:*}" cp="${m##*:}"
-                    [[ "$m" == *:* ]] || die "无效端口映射: $m"
-                    validate_port "$lp"; validate_port "$cp"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson l "$((lp))" --argjson c "$((cp))" '.[$i].listen_port=$l|.[$i].cf_port=$c')
-                    idx=$((idx+1))
-                done
-                changed=true; ok "端口已更新"
-            fi
-        else
-            echo "当前端口: $(echo "$new_routes" | jq -r '[.[].listen_port|tostring] | join(",")')"
-            read -rp "新端口(逗号分隔，共${pc}个，留空=不改): " pr
-            if [[ -n "$pr" ]]; then
-                IFS=',' read -ra nps <<< "$pr"
-                [[ ${#nps[@]} -eq $pc ]] || die "数量不匹配"
-                local idx=0
-                for np in "${nps[@]}"; do
-                    np="${np// /}"; validate_port "$np"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((np))" '.[$i].listen_port=$p|.[$i].cf_port=$p')
-                    idx=$((idx+1))
-                done
-                changed=true; ok "端口已更新"
-            fi
-        fi
-    fi
+    config=$(gen_xray_config "$port" "$new_uid" "$new_path")
+    write_xray_config "$config"
+    xray_start
 
-    if [[ "$mc" == "3" || "$mc" == "4" ]]; then
-        echo "当前路径: $(echo "$new_routes" | jq -r '[.[].path] | join(", ")')"
-        read -rp "新 XHTTP 路径(留空=不改): " np
-        if [[ -n "$np" ]]; then
-            [[ "$np" == /* ]] || np="/${np}"
-            new_routes=$(echo "$new_routes" | jq --arg path "$np" '[.[]|.path=$path]')
-            changed=true; ok "路径已更新"
-        fi
-    fi
-
-    [[ "$changed" == "true" ]] || { echo "无修改"; return; }
-
-    write_xray_config "$(gen_xray_config "$new_routes" "$new_uid")"
-    restart_xray
-
-    if load_cf_account; then
-        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
-        ok "Origin Rules 已更新"
-    fi
-
-    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes")
-    save_links_snapshot "$domain" "$new_uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" --arg s "${new_uid:0:8}" \
-        '.uuid=$u|.short_id=$s|.routes=$r|.links=$l')"
-
-    echo; ok "配置已更新"; print_links "$links_json"
+    link=$(build_link "$new_uid" "$domain" "$new_path")
+    save_state "$(echo "$state" | jq \
+        --arg uid "$new_uid" --arg path "$new_path" --arg link "$link" \
+        '.uuid=$uid|.path=$path|.link=$link')"
+    write_file_atomic "$LAST_LINKS_PATH" 600 "域名: $domain
+UUID: $new_uid
+VLESS XHTTP 节点 $link"
+    ok "配置已更新"
+    echo "  VLESS XHTTP 节点 $link"
 }
 
-# ── 5. 查看当前配置 ──────────────────────────────────
 do_show_config() {
-    local state; state=$(load_existing_state)
-
-    echo
-    echo "域名:  $(echo "$state" | jq -r '.domain')"
-    echo "UUID:  $(echo "$state" | jq -r '.uuid')"
-    echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
-    echo
-    echo "入站:"
-    echo "$state" | jq -r '.routes[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
-    echo
-    echo -n "xray: "; svc_is_active && echo "运行中" || echo "未运行"
-    echo
-    echo "订阅:"
-    print_links "$(echo "$state" | jq '.links')"
-    echo
+    local state
+    state=$(load_existing_state)
+    echo "$state" | jq -r '
+        "域名:       " + .domain,
+        "UUID:       " + .uuid,
+        "XHTTP 路径: " + .path,
+        "本地监听:   127.0.0.1:" + (.local_port|tostring)'
+    printf 'xray:              '; xray_is_active && echo "运行中" || echo "未运行"
+    printf 'cloudflared-xray:  '; cloudflared_is_active && echo "运行中" || echo "未运行"
 }
 
-# ── 6. 更新外部端口（NAT 快捷操作）──────────────────
-do_update_ports() {
-    local state; state=$(load_existing_state)
-
-    local domain routes_json net_mode
-    domain=$(echo "$state" | jq -r '.domain')
-    routes_json=$(echo "$state" | jq '.routes')
-    net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
-
-    echo
-    echo "当前端口映射:"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port) -> 外部:\(.cf_port)"'
-    echo
-
-    local pc; pc=$(echo "$routes_json" | jq 'length')
-
-    if [[ "$net_mode" == "nat" ]]; then
-        info "NAT 模式: 只更新外部端口(CF Origin Rules)，xray 监听端口不变"
-        echo
-
-        local new_routes="$routes_json" idx=0
-        while IFS=$'\t' read -r proto old_cp; do
-            read -rp "${proto} 新外部端口(当前=${old_cp}): " ne
-            [[ -n "$ne" ]] || die "不能为空"
-            validate_port "$ne"
-            new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
-            idx=$((idx+1))
-        done < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
-
-        echo
-        echo "更新预览:"
-        echo "$new_routes" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port) -> 外部:\(.cf_port)"'
-        read -rp "确认? (Y/n): " confirm
-        [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
-
-        # 只更新 CF Origin Rules，不动 xray
-        load_cf_account || die "未找到 CF 凭据"
-        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
-        ok "Origin Rules 已更新"
-
-        # 同时更新 DNS（公网 IP 可能也变了）
-        local public_ip; public_ip=$(get_public_ip)
-        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id')
-        local current_dns; current_dns=$(cf_get_dns "$zone_id" "$domain")
-        local current_ip; current_ip=$(echo "$current_dns" | jq -r '.content // ""')
-        if [[ "$current_ip" != "$public_ip" ]]; then
-            cf_upsert_dns "$zone_id" "$domain" "$public_ip" >/dev/null
-            ok "DNS 已更新: $domain -> $public_ip"
-        fi
-
-        local uid; uid=$(echo "$state" | jq -r '.uuid')
-        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
-        save_links_snapshot "$domain" "$uid" "$links_json"
-        save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
-
-        echo; ok "外部端口已更新"; print_links "$links_json"
-    else
-        info "直连模式: 端口变更需要同时修改 xray 监听，请使用 [4.修改配置]"
-    fi
-}
-
-# ── 7. 重启 xray ─────────────────────────────────────
 do_restart() {
-    if ! svc_is_active; then
-        echo "xray 当前未运行，正在启动..."
-    else
-        echo "正在重启 xray..."
-    fi
-    restart_xray
+    load_existing_state >/dev/null
+    check_cloudflared
+    xray_start
+    cloudflared_start
 }
 
-# ── 主入口 ────────────────────────────────────────────
 ensure_shortcut() {
     local target="/usr/local/bin/x"
     [[ -f "$target" ]] && return
-    cat > "$target" << 'SCEOF'
+    cat > "$target" <<'EOF'
 #!/bin/sh
 exec bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh) "$@"
-SCEOF
+EOF
     chmod +x "$target"
 }
 
 main() {
-    [[ "$(id -u)" == "0" ]] || die "请使用 root 运行此脚本"
+    [[ "$(id -u)" == 0 ]] || die "请使用 root 运行此脚本"
     detect_init
     install_deps
     need_cmd curl; need_cmd jq
     ensure_shortcut
 
-    local state current_domain="" net_mode=""
+    local current=""
     if [[ -f "$STATE_PATH" ]]; then
-        state=$(load_state 2>/dev/null) || die "状态文件损坏: $STATE_PATH（请先修复或备份现场）"
-    else
-        state=""
-    fi
-    if [[ -n "$state" ]]; then
-        current_domain=$(echo "$state" | jq -r '.domain // ""')
-        net_mode=$(echo "$state" | jq -r '.net_mode // ""')
+        current=$(load_state 2>/dev/null) || die "状态文件损坏: $STATE_PATH"
     fi
 
     echo
-    echo "  xray-cf-lite ($INIT_SYSTEM)"
+    echo "  xray-cf-lite · Cloudflare Tunnel ($INIT_SYSTEM)"
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
-    echo "  3. 查看订阅"
-    echo "  4. 修改配置(UUID/端口/XHTTP路径)"
+    echo "  3. 查看节点链接"
+    echo "  4. 修改 UUID/XHTTP 路径"
     echo "  5. 查看当前配置"
-    echo "  6. 更新外部端口(NAT换端口)"
-    echo "  7. 重启 xray"
-    [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
+    echo "  6. 重启服务"
+    [[ -n "$current" ]] && echo "     (当前: $(echo "$current" | jq -r '.domain'))"
     echo
 
-    read -rp "请选择 [1-7]: " choice
+    read -rp "请选择 [1-6]: " choice
     case "$choice" in
-        1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
-        4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
-        7) do_restart ;;
+        1) do_install ;;
+        2) do_uninstall ;;
+        3) do_show ;;
+        4) do_modify ;;
+        5) do_show_config ;;
+        6) do_restart ;;
         *) die "无效选项: $choice" ;;
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
