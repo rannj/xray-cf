@@ -277,8 +277,8 @@ gen_xray_config() {
             listen:"127.0.0.1",
             port:$port,
             protocol:"vless",
-            settings:{users:[{id:$uid}],decryption:"none"},
-            streamSettings:{method:"xhttp",security:"none",xhttpSettings:{path:$path}},
+            settings:{clients:[{id:$uid}],decryption:"none"},
+            streamSettings:{network:"xhttp",security:"none",xhttpSettings:{path:$path}},
             sniffing:{enabled:true,destOverride:["http","tls","quic"]}
         }],
         outbounds:[
@@ -296,7 +296,7 @@ write_xray_config() {
     mkdir -p "$XRAY_CONFIG_DIR"
     tmp=$(mktemp "$XRAY_CONFIG_DIR/.config.json.XXXXXX")
     printf '%s\n' "$content" > "$tmp"
-    if ! validation_output=$("$XRAY_BINARY" run -test -config "$tmp" 2>&1); then
+    if ! validation_output=$("$XRAY_BINARY" run -test -format=json -config "$tmp" 2>&1); then
         printf '%s\n' "$validation_output" >&2
         rm -f "$tmp"
         die "生成的 Xray 配置未通过校验"
